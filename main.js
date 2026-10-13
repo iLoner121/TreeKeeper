@@ -419,10 +419,10 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     const parsed = this.parseCallout(content);
     const probe = parsed ? parsed.links.slice() : [];
     // Fast path: already perfect (link present, sorted, two-line) — skip write.
-    if (probe.indexOf(file.basename) !== -1 && this.applyCallout(content, probe) === null) return;
+    if (probe.indexOf(file.basename) !== -1 && this.applyCallout(content, probe) === null) return moc;
     // Re-check existence right before writing: vault.process would resurrect
     // a file that was deleted between our read and the write.
-    if (!this.app.vault.getAbstractFileByPath(moc)) return;
+    if (!this.app.vault.getAbstractFileByPath(moc)) return moc;
     try {
       await this.app.vault.process(mocFile, (c) => {
         const p = this.parseCallout(c);
@@ -433,6 +433,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     } catch (e) {
       // file vanished mid-operation (e.g. rapid deletes)
     }
+    return moc;
   }
 
   async unlinkOne(filePath) {
@@ -451,7 +452,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     const parsed = this.parseCallout(content);
     if (!parsed || parsed.links.indexOf(basename) === -1) return;
     // Re-check existence right before writing (see linkOne).
-    if (!this.app.vault.getAbstractFileByPath(moc)) return;
+    if (!this.app.vault.getAbstractFileByPath(moc)) return moc;
     try {
       await this.app.vault.process(mocFile, (c) => {
         const p = this.parseCallout(c);
@@ -462,6 +463,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     } catch (e) {
       // file vanished mid-operation (e.g. rapid deletes)
     }
+    return moc;
   }
 
   onCreated(file) {
@@ -536,18 +538,51 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     this._syncTimer = setTimeout(() => {
       this._syncTimer = null;
       this.drainPending();
-    }, 1500);
+    }, 3000);
   }
 
   async runOp(op) {
-    if (op.type === "add") await this.linkOne(op.path);
-    else await this.unlinkOne(op.path);
+    if (op.type === "add") return await this.linkOne(op.path);
+    else return await this.unlinkOne(op.path);
   }
 
   async drainPending() {
     if (this._busy) return; // long commands drain explicitly at their end
+    const touched = new Set();
     while (this._pending.length) {
-      await this.runOp(this._pending.shift());
+      const moc = await this.runOp(this._pending.shift());
+      if (moc) touched.add(moc);
+    }
+    // Self-heal: after a (usually sync-driven) burst, re-verify every
+    // touched MOC against the ideal computed from the full, current vault.
+    // This corrects links that were written while the vault view was still
+    // partial mid-sync (e.g. a deep note delivered before its folder note).
+    if (touched.size) {
+      await this.healMocs(Array.from(touched));
+    }
+  }
+
+  // Rewrite each given MOC's callout to exactly match its ideal link set.
+  async healMocs(mocList) {
+    const { mocSets, mocPaths } = this.buildIdealIndex();
+    for (const moc of mocList) {
+      const f = this.app.vault.getAbstractFileByPath(moc);
+      if (!f) continue;
+      let content;
+      try {
+        content = await this.app.vault.read(f);
+      } catch (e) {
+        continue;
+      }
+      const ideal = mocPaths.has(moc) && mocSets.has(moc) ? Array.from(mocSets.get(moc)) : [];
+      const next = this.applyCallout(content, ideal);
+      if (next === null) continue;
+      if (!this.app.vault.getAbstractFileByPath(moc)) continue;
+      try {
+        await this.app.vault.process(f, (c) => this.applyCallout(c, ideal) || c);
+      } catch (e) {
+        // file vanished mid-operation
+      }
     }
   }
 
@@ -967,3 +1002,5 @@ class StyleApplyModal extends Modal {
     this.contentEl.empty();
   }
 }
+
+/* nosourcemap */
