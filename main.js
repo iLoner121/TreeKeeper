@@ -11,6 +11,7 @@ const DEFAULT_SETTINGS = {
   mocTitle: "",
   mocCalloutType: "quote",
   mocFold: "-",
+  autoUpdate: true,
 };
 
 // Minimal i18n (English + Chinese), keyed on Obsidian's language setting.
@@ -25,6 +26,9 @@ const STR = {
     cmdCleanup: "Clean blacklisted folders' callouts",
     cmdDedupe: "Remove duplicate links",
     busy: "TreeKeeper is busy — wait for the current run to finish.",
+    secBehavior: "Behavior",
+    nameAutoUpdate: "Update links automatically",
+    descAutoUpdate: "Watch the vault and update callout links as notes are created, deleted, renamed or moved. Turn this off to make TreeKeeper fully manual — links then only change when you run the commands.",
     secStyle: "Callout style",
     secFolders: "Folder notes",
     nameType: "Callout type",
@@ -68,6 +72,9 @@ const STR = {
     cmdCleanup: "清理黑名单文件夹的 callout",
     cmdDedupe: "移除重复链接",
     busy: "TreeKeeper 正在运行中——请等待当前任务完成。",
+    secBehavior: "行为",
+    nameAutoUpdate: "自动更新链接",
+    descAutoUpdate: "监听仓库，在笔记新建、删除、重命名或移动时自动更新 callout 链接。关闭后 TreeKeeper 变为全手动——只有运行命令时链接才会变化。",
     secStyle: "Callout 样式",
     secFolders: "文件夹笔记",
     nameType: "Callout 类型",
@@ -467,18 +474,21 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   }
 
   onCreated(file) {
+    if (!this.settings.autoUpdate) return;
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (this.isBlacklisted(file.path)) return;
     this.dispatch({ type: "add", path: file.path });
   }
 
   onDeleted(file) {
+    if (!this.settings.autoUpdate) return;
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (this.isBlacklisted(file.path)) return;
     this.dispatch({ type: "remove", path: file.path });
   }
 
   onRenamed(file, oldPath) {
+    if (!this.settings.autoUpdate) return;
     if (file instanceof TFolder) {
       // Folder rename/move: re-anchor its folder note in the parent MOC.
       this.dispatch({ type: "remove", path: this.mocPathFor(oldPath) });
@@ -835,6 +845,18 @@ class TreeKeeperSettingTab extends PluginSettingTab {
     };
     renderPreview();
 
+    new Setting(containerEl).setName(t("secBehavior")).setHeading();
+
+    new Setting(containerEl)
+      .setName(t("nameAutoUpdate"))
+      .setDesc(t("descAutoUpdate"))
+      .addToggle((tg) =>
+        tg.setValue(this.plugin.settings.autoUpdate !== false).onChange(async (v) => {
+          this.plugin.settings.autoUpdate = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
     new Setting(containerEl).setName(t("secStyle")).setHeading();
 
     new Setting(containerEl)
@@ -1003,4 +1025,5 @@ class StyleApplyModal extends Modal {
   }
 }
 
+/* nosourcemap */
 /* nosourcemap */
