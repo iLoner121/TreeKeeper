@@ -12,6 +12,7 @@ const DEFAULT_SETTINGS = {
   mocCalloutType: "quote",
   mocFold: "-",
   autoUpdate: true,
+  debugLog: false,
 };
 
 // Minimal i18n (English + Chinese), keyed on Obsidian's language setting.
@@ -30,6 +31,8 @@ const STR = {
     secBehavior: "Behavior",
     nameAutoUpdate: "Update links automatically",
     descAutoUpdate: "Watch the vault and update callout links as notes are created, deleted, renamed or moved. Turn this off to make TreeKeeper fully manual — links then only change when you run the commands.",
+    nameDebugLog: "Debug log",
+    descDebugLog: "Append diagnostic events to .tk-debug.log at the vault root. For troubleshooting — keep off in normal use.",
     secStyle: "Callout style",
     secFolders: "Folder notes",
     nameType: "Callout type",
@@ -77,6 +80,8 @@ const STR = {
     secBehavior: "行为",
     nameAutoUpdate: "自动更新链接",
     descAutoUpdate: "监听仓库，在笔记新建、删除、重命名或移动时自动更新 callout 链接。关闭后 TreeKeeper 变为全手动——只有运行命令时链接才会变化。",
+    nameDebugLog: "调试日志",
+    descDebugLog: "把诊断事件追加写入仓库根目录的 .tk-debug.log。用于排查问题——平时请保持关闭。",
     secStyle: "Callout 样式",
     secFolders: "文件夹笔记",
     nameType: "Callout 类型",
@@ -140,6 +145,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     if (mc) {
       this.registerEvent(
         mc.on("resolved", () => {
+          this.dbg("metadataCache resolved → cacheReady=true");
           this._cacheReady = true;
           this.drainPending();
         })
@@ -147,9 +153,11 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     }
     // Safety net in case "resolved" never fires on some setups.
     this._cacheTimer = setTimeout(() => {
+      this.dbg("cache safety timer fired");
       this._cacheReady = true;
       this.drainPending();
     }, 15000);
+    this.dbg("onload done, cacheReady=" + this._cacheReady);
 
     this.addSettingTab(new TreeKeeperSettingTab(this.app, this));
 
@@ -163,8 +171,8 @@ module.exports = class TreeKeeperPlugin extends Plugin {
       const s = this.app.internalPlugins && this.app.internalPlugins.plugins && this.app.internalPlugins.plugins.sync;
       const core = s && (s.instance || s);
       if (core && typeof core.on === "function") {
-        this.registerEvent(core.on("vault-synced", () => this.drainPending()));
-        this.registerEvent(core.on("status-change", (st) => { if (st !== "syncing") this.drainPending(); }));
+        this.registerEvent(core.on("vault-synced", () => { this.dbg("sync vault-synced"); this.drainPending(); }));
+        this.registerEvent(core.on("status-change", (st) => { this.dbg("sync status-change: " + st); if (st !== "syncing") this.drainPending(); }));
       }
     } catch (e) { /* sync unavailable — events run immediately */ }
 
@@ -207,6 +215,14 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   t(key) {
     const table = STR[this.lang()] || STR.en;
     return table[key] || STR.en[key] || key;
+  }
+
+  // Append a diagnostic line to .tk-debug.log (only when debugLog is on).
+  dbg(msg) {
+    if (!this.settings || !this.settings.debugLog) return;
+    try {
+      this.app.vault.adapter.append(".tk-debug.log", new Date().toISOString() + " " + msg + "\n");
+    } catch (e) { /* logging is best-effort */ }
   }
 
   onunload() {
@@ -516,6 +532,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   onCreated(file) {
     if (!this.settings.autoUpdate) return;
     if (!(file instanceof TFile) || file.extension !== "md") return;
+    this.dbg("create: " + file.path);
     if (this.isBlacklisted(file.path)) return;
     this.dispatch({ type: "add", path: file.path });
   }
@@ -523,12 +540,14 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   onDeleted(file) {
     if (!this.settings.autoUpdate) return;
     if (!(file instanceof TFile) || file.extension !== "md") return;
+    this.dbg("delete: " + file.path);
     if (this.isBlacklisted(file.path)) return;
     this.dispatch({ type: "remove", path: file.path });
   }
 
   onRenamed(file, oldPath) {
     if (!this.settings.autoUpdate) return;
+    this.dbg("rename: " + oldPath + " → " + (file ? file.path : "?"));
     if (file instanceof TFolder) {
       // Folder rename/move: re-anchor its folder note in the parent MOC.
       this.dispatch({ type: "remove", path: this.mocPathFor(oldPath) });
@@ -569,6 +588,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   }
 
   dispatch(op) {
+    this.dbg("dispatch " + op.type + " " + op.path + " busy=" + this._busy + " ready=" + this._cacheReady + " sync=" + this.isSyncActive());
     if (this._busy) {
       this._pending.push(op);
       return;
@@ -604,6 +624,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   async drainPending() {
     if (this._busy) return; // long commands drain explicitly at their end
     if (!this._cacheReady) return; // never work against a partial index
+    this.dbg("drain start, pending=" + this._pending.length);
     const touched = new Set();
     while (this._pending.length) {
       const moc = await this.runOp(this._pending.shift());
@@ -614,6 +635,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     // This corrects links that were written while the vault view was still
     // partial mid-sync (e.g. a deep note delivered before its folder note).
     if (touched.size) {
+      this.dbg("heal MOCs: " + Array.from(touched).join(", "));
       await this.healMocs(Array.from(touched));
     }
   }
@@ -662,6 +684,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   // ---------- commands ----------
 
   async cmdSyncAll(force) {
+    this.dbg("cmd sync-all force=" + force);
     if (!this.acquire()) return;
     try {
       const { mocSets, mocPaths } = await this.buildIdealIndex();
@@ -734,6 +757,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   }
 
   async cmdCheck(kind) {
+    this.dbg("cmd check " + kind);
     if (!this.acquire()) return;
     try {
       const notice = new Notice("Checking links...", 0);
@@ -764,6 +788,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   }
 
   async cmdCleanupBlacklist() {
+    this.dbg("cmd cleanup-blacklist");
     if (!this.acquire()) return;
     try {
       let cleaned = 0;
@@ -787,6 +812,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   }
 
   async cmdRemoveDuplicates() {
+    this.dbg("cmd remove-duplicates");
     if (!this.acquire()) return;
     try {
       let fixed = 0;
@@ -835,6 +861,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   // header (type/fold/icon/title). Links are never touched. Also migrates
   // legacy forms: strips old body markers and old span-form titles.
   async applyCalloutStyle() {
+    this.dbg("apply-callout-style");
     const sentinel = this.sentinel();
     const token = this.sigToken();
     let changed = 0;
@@ -903,6 +930,16 @@ class TreeKeeperSettingTab extends PluginSettingTab {
       .addToggle((tg) =>
         tg.setValue(this.plugin.settings.autoUpdate !== false).onChange(async (v) => {
           this.plugin.settings.autoUpdate = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(t("nameDebugLog"))
+      .setDesc(t("descDebugLog"))
+      .addToggle((tg) =>
+        tg.setValue(!!this.plugin.settings.debugLog).onChange(async (v) => {
+          this.plugin.settings.debugLog = v;
           await this.plugin.saveSettings();
         })
       );
