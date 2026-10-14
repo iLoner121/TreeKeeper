@@ -26,6 +26,7 @@ const STR = {
     cmdCleanup: "Clean blacklisted folders' callouts",
     cmdDedupe: "Remove duplicate links",
     busy: "TreeKeeper is busy — wait for the current run to finish.",
+    indexing: "TreeKeeper is waiting for Obsidian to finish indexing the vault — try again in a few seconds.",
     secBehavior: "Behavior",
     nameAutoUpdate: "Update links automatically",
     descAutoUpdate: "Watch the vault and update callout links as notes are created, deleted, renamed or moved. Turn this off to make TreeKeeper fully manual — links then only change when you run the commands.",
@@ -72,6 +73,7 @@ const STR = {
     cmdCleanup: "清理黑名单文件夹的 callout",
     cmdDedupe: "移除重复链接",
     busy: "TreeKeeper 正在运行中——请等待当前任务完成。",
+    indexing: "TreeKeeper 正在等待 Obsidian 完成索引——请几秒后再试。",
     secBehavior: "行为",
     nameAutoUpdate: "自动更新链接",
     descAutoUpdate: "监听仓库，在笔记新建、删除、重命名或移动时自动更新 callout 链接。关闭后 TreeKeeper 变为全手动——只有运行命令时链接才会变化。",
@@ -126,6 +128,28 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     this._busy = false;
     this._pending = [];
     this._syncTimer = null;
+    this._cacheTimer = null;
+
+    // Startup race guard: right after a restart the metadata cache is still
+    // indexing, and file listings are partial. Computing links against a
+    // partial view corrupts MOCs (deep notes get dumped into higher-level
+    // MOCs), so all event processing waits until the cache has resolved.
+    this._cacheReady = false;
+    const mc = this.app.metadataCache;
+    if (mc && mc.initialized) this._cacheReady = true;
+    if (mc) {
+      this.registerEvent(
+        mc.on("resolved", () => {
+          this._cacheReady = true;
+          this.drainPending();
+        })
+      );
+    }
+    // Safety net in case "resolved" never fires on some setups.
+    this._cacheTimer = setTimeout(() => {
+      this._cacheReady = true;
+      this.drainPending();
+    }, 15000);
 
     this.addSettingTab(new TreeKeeperSettingTab(this.app, this));
 
@@ -187,6 +211,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
 
   onunload() {
     if (this._syncTimer) clearTimeout(this._syncTimer);
+    if (this._cacheTimer) clearTimeout(this._cacheTimer);
   }
 
   // ---------- path rules ----------
@@ -268,8 +293,23 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     return null;
   }
 
+  // Recursively list every folder path from disk. The in-memory tree
+  // (getAllLoadedFiles) is lazy and can miss folders that were never
+  // expanded in the UI — e.g. right after a restart or for API-created
+  // folders — which would make ideal-link computation silently wrong.
+  async listFolders(dir) {
+    const out = [];
+    const list = await this.app.vault.adapter.list(dir);
+    for (const p of list.folders) {
+      out.push(p);
+      const sub = await this.listFolders(p);
+      for (const s of sub) out.push(s);
+    }
+    return out;
+  }
+
   // For every MOC, the set of basenames whose nearest MOC it is.
-  buildIdealIndex() {
+  async buildIdealIndex() {
     const indexPath = this.buildPathIndex();
     const maps = this.buildMaps();
     const mocSets = new Map();
@@ -283,8 +323,8 @@ module.exports = class TreeKeeperPlugin extends Plugin {
     }
     // Every folder's note path under the current position + pattern.
     const mocPaths = new Set();
-    for (const f of this.app.vault.getAllLoadedFiles()) {
-      if (f instanceof TFolder) mocPaths.add(this.mocPathFor(f.path));
+    for (const folder of await this.listFolders("")) {
+      mocPaths.add(this.mocPathFor(folder));
     }
     return { indexPath, maps, mocSets, mocPaths };
   }
@@ -533,6 +573,11 @@ module.exports = class TreeKeeperPlugin extends Plugin {
       this._pending.push(op);
       return;
     }
+    if (!this._cacheReady) {
+      // Metadata cache still indexing after a restart — wait.
+      this._pending.push(op);
+      return;
+    }
     if (this.isSyncActive()) {
       // Likely a remote change streamed in by sync: defer until the batch
       // settles so we don't race with the synced MOC content.
@@ -558,6 +603,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
 
   async drainPending() {
     if (this._busy) return; // long commands drain explicitly at their end
+    if (!this._cacheReady) return; // never work against a partial index
     const touched = new Set();
     while (this._pending.length) {
       const moc = await this.runOp(this._pending.shift());
@@ -574,7 +620,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
 
   // Rewrite each given MOC's callout to exactly match its ideal link set.
   async healMocs(mocList) {
-    const { mocSets, mocPaths } = this.buildIdealIndex();
+    const { mocSets, mocPaths } = await this.buildIdealIndex();
     for (const moc of mocList) {
       const f = this.app.vault.getAbstractFileByPath(moc);
       if (!f) continue;
@@ -597,6 +643,10 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   }
 
   acquire() {
+    if (!this._cacheReady) {
+      new Notice(this.t("indexing"));
+      return false;
+    }
     if (this._busy) {
       new Notice(this.t("busy"));
       return false;
@@ -614,7 +664,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
   async cmdSyncAll(force) {
     if (!this.acquire()) return;
     try {
-      const { mocSets, mocPaths } = this.buildIdealIndex();
+      const { mocSets, mocPaths } = await this.buildIdealIndex();
       const files = this.app.vault.getMarkdownFiles();
       const label = force ? "Sync (rebuild)" : "Fix (minimal)";
       const notice = new Notice(label + ": 0/" + files.length, 0);
@@ -651,7 +701,7 @@ module.exports = class TreeKeeperPlugin extends Plugin {
 
   // One read-only scan producing the three check sets.
   async scanAll() {
-    const { indexPath, maps, mocSets, mocPaths } = this.buildIdealIndex();
+    const { indexPath, maps, mocSets, mocPaths } = await this.buildIdealIndex();
     const files = this.app.vault.getMarkdownFiles();
     const dupes = [];
     const wrong = [];
@@ -1025,5 +1075,6 @@ class StyleApplyModal extends Modal {
   }
 }
 
+/* nosourcemap */
 /* nosourcemap */
 /* nosourcemap */

@@ -1,7 +1,7 @@
 {
   "id": "tree-keeper",
   "name": "TreeKeeper",
-  "version": "2.10.0",
+  "version": "2.10.1",
   "minAppVersion": "1.0.0",
   "description": "Keeps dictionary-sorted wikilink callouts at the tail of your folder notes, connecting your MOC tree automatically — live link maintenance, vault-wide checks and fixes, configurable blacklists and folder-note naming.",
   "author": "Edvin G.",
